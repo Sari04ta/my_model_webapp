@@ -2,3 +2,4 @@ streamlit>=1.22
 transformers>=4.30
 torch>=2.0
 sentencepiece
+accelerate
