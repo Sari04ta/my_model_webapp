@@ -30,8 +30,9 @@ import io
 import pickle
 
 # === Paths to user notebooks (these are the files you uploaded) ===
-FINAL_NOTEBOOK = Path("/mnt/data/pap (1).ipynb")
-PROTO_NOTEBOOK = Path("/mnt/data/prototype (1).ipynb")
+FINAL_NOTEBOOK = Path("pap.ipynb")
+PROTO_NOTEBOOK = Path("prototype.ipynb")
+
 
 # === Page config & CSS ===
 st.set_page_config(page_title="PAP Model — Demo", layout="wide")
