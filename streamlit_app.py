@@ -1,331 +1,191 @@
 # streamlit_app.py
 """
-Beautiful Streamlit app that loads your model from two notebooks:
-- Final model notebook: /mnt/data/pap (1).ipynb
-- Prototype notebook (helpers/UI examples): /mnt/data/prototype (1).ipynb
+Streamlit UI for the PAP model using HuggingFace model 'google/flan-t5-small'.
 
-Behavior:
-- Import code cells from both notebooks into separate temporary modules.
-- Prefer predictor from the final notebook; if missing, fall back to prototype.
-- Auto-detect `feature_names` or `X_example` from either notebook to build a form.
-- Accept raw JSON/text input or file upload for model.pkl.
-- Show prediction + debug information.
+Features:
+- Loads the model/tokenizer from transformers by model name.
+- Text input box (prompt) and controls (max_length, temperature, num_beams).
+- Shows generation result, token count, and raw model output.
+- Simple caching so model loads once per process.
+- Optional: accept uploaded text files for batch inference.
 
-How to run:
+To run:
 pip install -r requirements.txt
 streamlit run streamlit_app.py
 """
 
 from pathlib import Path
-import nbformat
-import importlib.util
-import sys
-import tempfile
-import traceback
-import inspect
-import types
 import streamlit as st
-import ast
-import io
-import pickle
 
-# === Paths to user notebooks (these are the files you uploaded) ===
-FINAL_NOTEBOOK = Path("pap.ipynb")
-PROTO_NOTEBOOK = Path("prototype.ipynb")
+# Transformers & torch imports are done lazily to show friendly error messages
+@st.cache_resource
+def load_model_tokenizer(model_name: str, device: int = -1):
+    """
+    Load the seq2seq model and tokenizer. device = -1 uses CPU; 0 uses first GPU.
+    Returns (tokenizer, model, pipeline_fn)
+    """
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    import torch
 
+    # Load tokenizer & model
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    # Move to device if GPU available
+    if device >= 0 and torch.cuda.is_available():
+        model.to(torch.device(f"cuda:{device}"))
+    return tokenizer, model
 
-# === Page config & CSS ===
-st.set_page_config(page_title="PAP Model — Demo", layout="wide")
+def generate_text(tokenizer, model, prompt: str, max_length: int = 128,
+                  num_beams: int = 4, temperature: float = 1.0, do_sample: bool = False,
+                  return_full: bool = False):
+    """
+    Generate text from the model. Returns generated string (and optionally generation details).
+    """
+    import torch
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+    # Move inputs to model device
+    try:
+        device = next(model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+    except Exception:
+        pass
+
+    # generation kwargs
+    gen_kwargs = dict(
+        max_length=max_length,
+        num_beams=num_beams if not do_sample else 1,
+        temperature=temperature if do_sample else None,
+        do_sample=do_sample,
+        early_stopping=True,
+        no_repeat_ngram_size=2,
+    )
+    # Remove None values
+    gen_kwargs = {k: v for k, v in gen_kwargs.items() if v is not None}
+
+    # Generate
+    with torch.no_grad():
+        out = model.generate(**inputs, **gen_kwargs)
+    decoded = tokenizer.batch_decode(out, skip_special_tokens=True)
+    if return_full:
+        return decoded, out
+    return decoded[0]
+
+# ---------------------------
+# Page layout & UI
+# ---------------------------
+st.set_page_config(page_title="PAP — Flan-T5 demo", layout="wide")
 st.markdown(
     """
     <style>
-    /* Glass card */
-    .glass {
-      background: rgba(255, 255, 255, 0.06);
-      border-radius: 12px;
-      padding: 18px;
-      box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
-      border: 1px solid rgba(255,255,255,0.06);
-      backdrop-filter: blur(6px);
-    }
-    .muted { color: #bdbdbd; font-size: 0.95rem; }
-    .big { font-size: 1.25rem; font-weight: 600; }
+    .big-title { font-size:32px; font-weight:700; }
+    .muted { color: #bdbdbd; }
+    .card { background: rgba(255,255,255,0.03); padding:16px; border-radius:10px; border:1px solid rgba(255,255,255,0.03); }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# Header
-col1, col2 = st.columns([3,1])
-with col1:
-    st.title("PAP Model — Interactive Demo")
-    st.markdown("**Upload-ready Streamlit app** which combines your prototype and final model notebooks.")
-with col2:
-    st.image("https://static.streamlit.io/examples/dice.jpg", width=100)  # decorative
+st.markdown('<div class="big-title">PAP — Flan-T5 (google/flan-t5-small) Demo</div>', unsafe_allow_html=True)
+st.markdown("Interactive demo — enter a prompt and get model output. Deployable on Streamlit Cloud.")
 
-st.write("")  # spacing
-
-# Sidebar
+# Sidebar controls
 with st.sidebar:
-    st.header("About this demo")
-    st.write("Model loaded from your notebooks (final prioritized).")
-    st.markdown("**Actions**")
-    st.markdown("- Try example inputs\n- Upload `model.pkl` to override\n- Use Raw JSON input")
+    st.header("Model & Settings")
+    model_name = st.text_input("HuggingFace model name", value="google/flan-t5-small")
+    use_gpu = st.checkbox("Use GPU if available", value=False)
+    device_idx = 0 if use_gpu else -1
     st.markdown("---")
-    st.markdown("**Files used**:")
-    st.text(FINAL_NOTEBOOK)
-    st.text(PROTO_NOTEBOOK)
+    st.markdown("Generation defaults")
+    default_max_length = st.slider("Max length", min_value=16, max_value=512, value=128, step=8)
+    default_num_beams = st.slider("num_beams (deterministic search)", min_value=1, max_value=8, value=4)
+    default_temperature = st.slider("temperature (for sampling)", min_value=0.1, max_value=2.0, value=1.0, step=0.1)
+    do_sample = st.checkbox("Use sampling (stochastic)", value=False)
     st.markdown("---")
-    st.markdown("Need a FastAPI + React production API? Ask me to generate it.")
+    st.markdown("Advanced")
+    show_raw = st.checkbox("Show raw tokens / outputs", value=False)
+    st.markdown("Note: first load may take a few seconds to download model files.")
 
-# Utility: import notebook cells as a module
-def import_notebook_module(nb_path: Path, module_name: str):
-    """
-    Read code cells from nb_path, write to a temp .py and import as module_name.
-    Returns module or raises an error.
-    """
-    if not nb_path.exists():
-        raise FileNotFoundError(f"Notebook not found: {nb_path}")
-    nb = nbformat.read(str(nb_path), as_version=4)
-    code_cells = [cell['source'] for cell in nb.cells if cell.cell_type == 'code']
-    combined = "\n\n# ---- cell split ----\n\n".join(code_cells)
-    tmp_dir = tempfile.mkdtemp(prefix=f"uploaded_nb_{module_name}_")
-    module_path = Path(tmp_dir) / f"{module_name}.py"
-    module_path.write_text(combined, encoding="utf-8")
-    spec = importlib.util.spec_from_file_location(module_name, str(module_path))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+# Main columns
+col_left, col_right = st.columns([2,1])
+with col_left:
+    st.subheader("Prompt")
+    prompt = st.text_area("Enter your prompt or input text", height=220,
+                          value="Translate English to French: The climate is changing rapidly. We must act now.")
+    max_length = st.number_input("Max tokens to generate", min_value=16, max_value=1024, value=default_max_length)
+    num_beams = st.number_input("num_beams", min_value=1, max_value=16, value=default_num_beams)
+    temperature = st.number_input("temperature", min_value=0.1, max_value=2.0, value=default_temperature, step=0.1)
+    do_sample = st.checkbox("Use sampling", value=do_sample)
+    run_btn = st.button("Generate")
+
+    st.markdown("---")
+    st.markdown("Batch input (optional)")
+    uploaded = st.file_uploader("Upload a text file (.txt) with multiple prompts (one per line)", type=["txt"])
+    if uploaded is not None:
+        content = uploaded.getvalue().decode("utf-8")
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
+        st.success(f"Loaded {len(lines)} prompts from file.")
+        # show a small sample
+        for i, line in enumerate(lines[:5]):
+            st.write(f"{i+1}. {line[:120]}{'...' if len(line) > 120 else ''}")
+
+with col_right:
+    st.subheader("Model status")
+    st.write("Model name:")
+    st.code(model_name)
     try:
-        spec.loader.exec_module(module)
+        st.write("Loading model...")
+        tokenizer, model = load_model_tokenizer(model_name, device=device_idx)
+        st.success("Model loaded.")
+        # show device
+        try:
+            import torch
+            device = next(model.parameters()).device
+            st.write("Device:", device)
+        except Exception:
+            pass
     except Exception as e:
-        # Import may still have created objects partially; return module with note
-        module.__import_error__ = traceback.format_exc()
-    return module
+        st.error("Failed to load model. See error below.")
+        st.text(str(e))
+        st.stop()
 
-# Import both notebooks (final first, prototype second)
-final_module = None
-proto_module = None
-final_import_error = None
-proto_import_error = None
-
-try:
-    final_module = import_notebook_module(FINAL_NOTEBOOK, "uploaded_nb_final")
-    final_import_error = getattr(final_module, "__import_error__", None)
-except Exception as e:
-    final_import_error = traceback.format_exc()
-    final_module = types.SimpleNamespace()  # empty fallback
-
-try:
-    proto_module = import_notebook_module(PROTO_NOTEBOOK, "uploaded_nb_proto")
-    proto_import_error = getattr(proto_module, "__import_error__", None)
-except Exception as e:
-    proto_import_error = traceback.format_exc()
-    proto_module = types.SimpleNamespace()
-
-# Helper: find predictor in a module
-def find_predictor_in_module(module):
-    # find predict() function
-    if hasattr(module, "predict") and callable(getattr(module, "predict")):
-        return getattr(module, "predict"), "function"
-    # find model object
-    if hasattr(module, "model"):
-        model_obj = getattr(module, "model")
-        if hasattr(model_obj, "predict") and callable(getattr(model_obj, "predict")):
-            return (lambda x: model_obj.predict(x)), "model"
-    # try any object with predict
-    for name, obj in vars(module).items():
-        if not name.startswith("_") and hasattr(obj, "predict") and callable(getattr(obj, "predict")):
-            return (lambda x, o=obj: o.predict(x)), f"object `{name}`"
-    return None, None
-
-# Try final, then prototype
-predictor, predictor_type = find_predictor_in_module(final_module)
-source_used = "final"
-if predictor is None:
-    predictor, predictor_type = find_predictor_in_module(proto_module)
-    source_used = "prototype" if predictor else None
-
-# UI: show import status
-with st.container():
-    st.markdown("<div class='glass'>", unsafe_allow_html=True)
-    st.markdown("### Model import status")
-    if final_import_error:
-        st.warning("Final notebook import produced warnings/errors. Predictor may still be available.")
-        st.text(final_import_error[:1000])
-    if proto_import_error:
-        st.info("Prototype notebook import produced warnings/errors (expected sometimes).")
-        st.text(proto_import_error[:800])
-    if predictor:
-        st.success(f"Predictor found (source: `{source_used}`, type: {predictor_type})")
-    else:
-        st.error("No predictor found in final or prototype notebooks.")
-        st.markdown("Make sure either notebook defines `predict(input)` or a `model` object with `.predict()`.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-st.write("")  # space
-
-# Gather metadata (feature_names, X_example) from final then prototype
-feature_names = getattr(final_module, "feature_names", None) or getattr(proto_module, "feature_names", None)
-X_example = getattr(final_module, "X_example", None) or getattr(proto_module, "X_example", None)
-examples = getattr(proto_module, "examples", None) or getattr(final_module, "examples", None)
-
-# Main two-column layout
-left, right = st.columns([2,1])
-
-with left:
-    st.markdown("## Input")
-    mode = st.radio("Input mode", ["Auto form", "Raw JSON / Text", "Upload model.pkl"], horizontal=True)
-
-    user_input = None
-    uploaded_model_override = None
-
-    if mode == "Upload model.pkl":
-        st.info("Upload a pickle file containing a model with `.predict()` to override the notebook model.")
-        up = st.file_uploader("Upload model.pkl", type=["pkl","pickle"])
-        if up is not None:
-            try:
-                uploaded_model_override = pickle.load(up)
-                if hasattr(uploaded_model_override, "predict") and callable(uploaded_model_override.predict):
-                    predictor = (lambda x, o=uploaded_model_override: o.predict(x))
-                    predictor_type = "uploaded model.pkl"
-                    st.success("Uploaded model loaded and will be used for predictions.")
-                else:
-                    st.error("Uploaded object does not have a callable `predict` method.")
-            except Exception as e:
-                st.error("Failed to load uploaded pickle.")
-                st.text(traceback.format_exc()[:800])
-
-    if mode == "Auto form":
-        # Build form from feature_names or X_example, else fallback
-        if feature_names and isinstance(feature_names, (list, tuple)):
-            st.write("Detected feature names — fill the fields below.")
-            inputs = {}
-            with st.form("auto_form"):
-                for fn in feature_names:
-                    # prefer numeric
-                    try:
-                        val = st.number_input(str(fn), value=0.0, format="%.6f")
-                    except Exception:
-                        val = st.text_input(str(fn), value="")
-                    inputs[fn] = val
-                submitted = st.form_submit_button("Run prediction")
-            if submitted:
-                # prepare input_data as a list or dict depending on what predictor expects
-                # We'll try list first then dict
-                input_as_list = [inputs[n] for n in feature_names]
-                input_as_dict = {n: inputs[n] for n in feature_names}
-                try:
-                    # attempt list
-                    user_input = input_as_list
-                    pred = predictor(user_input)
-                    st.success("Prediction:")
-                    st.write(pred)
-                except Exception:
-                    try:
-                        user_input = input_as_dict
-                        pred = predictor(user_input)
-                        st.success("Prediction:")
-                        st.write(pred)
-                    except Exception:
-                        st.error("Both list and dict attempts failed. See traceback below.")
-                        st.text(traceback.format_exc()[:1200])
-
-        elif X_example is not None:
-            st.write("Detected `X_example` in notebook — using it to build fields.")
-            inputs = {}
-            if isinstance(X_example, dict):
-                with st.form("dict_example_form"):
-                    for k, v in X_example.items():
-                        if isinstance(v, (int, float)):
-                            val = st.number_input(str(k), value=float(v))
-                        else:
-                            val = st.text_input(str(k), value=str(v))
-                        inputs[k] = val
-                    submitted = st.form_submit_button("Run prediction")
-                if submitted:
-                    try:
-                        user_input = {k: inputs[k] for k in inputs}
-                        pred = predictor(user_input)
-                        st.success("Prediction:")
-                        st.write(pred)
-                    except Exception:
-                        st.error("Prediction failed with dict input. See traceback.")
-                        st.text(traceback.format_exc()[:800])
-            elif hasattr(X_example, "__len__"):
-                with st.form("vec_example_form"):
-                    for i, v in enumerate(X_example):
-                        try:
-                            val = st.number_input(f"f{i}", value=float(v))
-                        except Exception:
-                            val = st.text_input(f"f{i}", value=str(v))
-                        inputs[f"f{i}"] = val
-                    submitted = st.form_submit_button("Run prediction")
-                if submitted:
-                    try:
-                        user_input = [inputs[f"f{i}"] for i in range(len(X_example))]
-                        pred = predictor(user_input)
-                        st.success("Prediction:")
-                        st.write(pred)
-                    except Exception:
-                        st.error("Prediction failed with vector input. See traceback.")
-                        st.text(traceback.format_exc()[:800])
+# Run generation
+if run_btn or (uploaded is not None):
+    with st.spinner("Generating..."):
+        try:
+            if uploaded is not None:
+                # batch generate
+                results = []
+                for ln in lines:
+                    out = generate_text(tokenizer, model, ln, max_length=max_length,
+                                        num_beams=int(num_beams), temperature=float(temperature),
+                                        do_sample=do_sample)
+                    results.append((ln, out))
+                st.markdown("### Batch results")
+                for i, (inp, out) in enumerate(results):
+                    st.markdown(f"**Prompt {i+1}:** {inp}")
+                    st.markdown(f"**Output:** {out}")
+                    st.markdown("---")
             else:
-                st.write("X_example format not recognized — fallback to Raw JSON mode.")
-        else:
-            st.write("No `feature_names` or `X_example` detected. Use Raw JSON / Text input or upload a model.pkl.")
-    elif mode == "Raw JSON / Text":
-        raw = st.text_area("Enter JSON, Python literal, or plain text input", height=220,
-                           placeholder='e.g. [1.0, 2.0, 3.0]  or  {"age": 20, "bmi": 23.4}')
-        if st.button("Run prediction (raw)"):
-            try:
-                try:
-                    parsed = ast.literal_eval(raw)
-                except Exception:
-                    import json
+                out = generate_text(tokenizer, model, prompt, max_length=max_length,
+                                    num_beams=int(num_beams), temperature=float(temperature),
+                                    do_sample=do_sample)
+                st.markdown("### Output")
+                st.write(out)
+                if show_raw:
+                    st.markdown("### Raw details")
+                    decoded, tok = None, None
                     try:
-                        parsed = json.loads(raw)
+                        decoded, tok = generate_text(tokenizer, model, prompt, max_length=max_length,
+                                                     num_beams=int(num_beams), temperature=float(temperature),
+                                                     do_sample=do_sample, return_full=True)
                     except Exception:
-                        parsed = raw
-                user_input = parsed
-                pred = predictor(user_input)
-                st.success("Prediction:")
-                st.write(pred)
-            except Exception:
-                st.error("Prediction failed. See traceback below.")
-                st.text(traceback.format_exc()[:1200])
-
-with right:
-    st.markdown("## Controls & Examples")
-    if examples:
-        st.markdown("### Example inputs (from prototype)")
-        if isinstance(examples, (list, tuple)):
-            for i, ex in enumerate(examples[:6]):
-                if st.button(f"Use example #{i+1}"):
-                    try:
-                        pred = predictor(ex)
-                        st.success("Prediction for example:")
-                        st.write(pred)
-                    except Exception:
-                        st.error("Prediction failed for this example.")
-                        st.text(traceback.format_exc()[:800])
-        else:
-            st.write("`examples` exists but is not a list/tuple — inspect in notebooks.")
-    else:
-        st.info("No example inputs provided in notebooks. You can add `examples = [...]` variable in prototype notebook.")
-
-    st.markdown("---")
-    st.markdown("### Debug / Info")
-    st.write(f"Predictor type: {predictor_type}")
-    if hasattr(final_module, "__import_error__") and final_module.__import_error__:
-        st.markdown("**Final notebook import trace (first 500 chars):**")
-        st.text(final_module.__import_error__[:500])
-    if hasattr(proto_module, "__import_error__") and proto_module.__import_error__:
-        st.markdown("**Prototype notebook import trace (first 500 chars):**")
-        st.text(proto_module.__import_error__[:500])
-
-st.markdown("---")
-st.markdown("## Notes & Next steps")
-st.markdown("""
-- If import fails because of heavy dependencies, consider exporting a lightweight `model.pkl` and upload it in the `Upload model.pkl` tab.
-- To turn this into a production API, I can create a FastAPI backend and a React frontend, plus Dockerfiles.
-""")
+                        pass
+                    if decoded is not None:
+                        st.write("Decoded:", decoded)
+                    if tok is not None:
+                        st.write("Tensor shape:", getattr(tok, "shape", None))
+        except Exception as e:
+            st.error("Generation failed. See traceback below.")
+            import traceback as tb
+            st.text(tb.format_exc())
